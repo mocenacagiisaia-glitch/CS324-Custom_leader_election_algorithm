@@ -150,10 +150,10 @@ implementation and verification are separate genuine milestones. Repository-loca
 commits identify the coding agent as `Codex` without changing your global Git
 identity. No remote was provided or inferred.
 
-To connect your own repository, replace the placeholder with its actual clone URL:
+To connect your own repository, this PowerShell command asks for its actual clone URL:
 
 ```powershell
-git remote add origin <YOUR_GITHUB_REPOSITORY_URL>
+git remote add origin (Read-Host 'Paste your GitHub repository clone URL')
 git fetch origin
 git branch -a
 git log --graph --oneline --decorate --all
