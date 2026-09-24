@@ -68,6 +68,8 @@ public final class WorkerNode extends UnicastRemoteObject implements WorkerRemot
         List<Peer> members = bootstrap.active();
         Peer gate = gate(members);
         if (!gate.equals(self)) return gate.connect().elect();
+        if (term != null && members.equals(termMembers)
+                && term.leader().connect().status().assignedJobs() < 5) return term;
         gateLock.writeLock().lock();
         try {
             members = bootstrap.active();
