@@ -30,7 +30,8 @@ public final class WorkerNode extends UnicastRemoteObject implements WorkerRemot
         this.engine = engine;
     }
 
-    @Override public Status status() {
+    // Share the admission/announcement monitor so term and counters describe one local state.
+    @Override public synchronized Status status() {
         return new Status(self, budget.jac(), budget.jobs(), term, List.copyOf(neighbours.values()));
     }
     @Override public void addNeighbour(Peer peer) {
