@@ -3,6 +3,7 @@ package edu.usp.cs324.network;
 import edu.usp.cs324.api.*;
 import java.math.BigInteger;
 import java.rmi.RemoteException;
+import java.rmi.ServerException;
 import java.rmi.registry.LocateRegistry;
 import java.rmi.server.UnicastRemoteObject;
 import java.util.*;
@@ -21,6 +22,7 @@ public final class WorkerNode extends UnicastRemoteObject implements WorkerRemot
     private final JobEngine engine;
     private volatile Term term;
     private volatile List<Peer> termMembers = List.of();
+    private volatile RemoteException uncertainAssignment;
 
     public WorkerNode(Peer self, BootstrapRemote bootstrap, int exportPort, JobEngine engine)
             throws RemoteException {
@@ -66,6 +68,7 @@ public final class WorkerNode extends UnicastRemoteObject implements WorkerRemot
     }
 
     @Override public Term elect() throws RemoteException {
+        requireKnownCompletion();
         List<Peer> members = bootstrap.active();
         Peer gate = gate(members);
         if (!gate.equals(self)) return gate.connect().elect();
@@ -73,6 +76,7 @@ public final class WorkerNode extends UnicastRemoteObject implements WorkerRemot
                 && term.leader().connect().status().assignedJobs() < 5) return term;
         gateLock.writeLock().lock();
         try {
+            requireKnownCompletion();
             members = bootstrap.active();
             if (term != null && members.equals(termMembers)
                     && term.leader().connect().status().assignedJobs() < 5) return term;
@@ -103,31 +107,55 @@ public final class WorkerNode extends UnicastRemoteObject implements WorkerRemot
             elect();
             BigInteger result = null;
             boolean accepted = false;
+            RemoteException failure = null;
             gateLock.readLock().lock();
             try {
+                requireKnownCompletion();
                 try {
                     result = term.leader().connect().assign(job, term, termMembers);
                     accepted = true;
                 } catch (RemoteException e) {
-                    if (!isRetry(e)) throw e;
+                    Throwable cause = remoteCause(e);
+                    if (!(cause instanceof RetryException)) {
+                        failure = e;
+                        if (!(cause instanceof JobFailedException)) {
+                            // A returned RMI call does not prove its remote task has stopped.
+                            uncertainAssignment = e;
+                            throw new RemoteException("Assignment outcome unknown; restart the whole cluster", e);
+                        }
+                    }
                 }
             } finally { gateLock.readLock().unlock(); }
-            // Write lock drains all accepted jobs before a new snapshot/election.
-            elect();
+            // Known failed jobs also consume a slot and must allow five-job rotation.
+            try { elect(); }
+            catch (RemoteException electionFailure) {
+                if (failure != null) failure.addSuppressed(electionFailure);
+                else if (accepted) System.err.println("Job completed, but election failed: " + electionFailure);
+                else throw electionFailure;
+            }
+            if (failure != null) throw failure;
             if (accepted) return result;
         }
     }
 
-    private static boolean isRetry(Throwable error) {
-        for (Throwable cause = error; cause != null; cause = cause.getCause()) {
-            if (cause instanceof RetryException) return true;
+    private void requireKnownCompletion() throws RemoteException {
+        if (uncertainAssignment != null) {
+            throw new RemoteException("Remote work may still be running; restart the whole cluster before new jobs or elections",
+                    uncertainAssignment);
         }
-        return false;
+    }
+
+    private static Throwable remoteCause(Throwable error) {
+        // Unwrap only RMI envelopes, not application causes inside a completed failure.
+        while (error instanceof ServerException && error.getCause() != null) error = error.getCause();
+        return error;
     }
 
     @Override public BigInteger assign(Job job, Term expected, List<Peer> workers) throws RemoteException {
-        if (engine == null) throw new RemoteException("JobEngine provider is not installed");
-        List<Job> parts = engine.split(job, workers.size());
+        if (engine == null) throw new JobFailedException("JobEngine provider is not installed", null);
+        List<Job> parts;
+        try { parts = engine.split(job, workers.size()); }
+        catch (RuntimeException e) { throw new JobFailedException("Invalid job; no work started", e); }
         synchronized (this) {
             if (!expected.equals(term) || !self.equals(term.leader())) throw new RetryException("Stale leader");
             int remoteAssignments = 0;
@@ -137,32 +165,61 @@ public final class WorkerNode extends UnicastRemoteObject implements WorkerRemot
         System.out.println("ASSIGN leader=" + self.id() + " term=" + expected.number()
                 + " jobs=" + budget.jobs() + " JAC=" + budget.jac());
         List<Future<BigInteger>> futures = new ArrayList<>();
-        for (int i = 0; i < parts.size(); i++) {
-            Peer peer = workers.get(i);
-            Job part = parts.get(i);
-            futures.add(execution.submit(() -> peer.connect().compute(part)));
-        }
+        RuntimeException dispatchFailure = null;
+        try {
+            for (int i = 0; i < parts.size(); i++) {
+                Peer peer = workers.get(i);
+                Job part = parts.get(i);
+                futures.add(execution.submit(() -> peer.connect().compute(part)));
+            }
+        } catch (RuntimeException e) { dispatchFailure = e; }
+        List<BigInteger> results = awaitTasks(futures, true, dispatchFailure);
+        try { return engine.aggregate(job.type(), results); }
+        catch (RuntimeException e) { throw new JobFailedException("Aggregation failed; no partial answer", e); }
+    }
+
+    private static List<BigInteger> awaitTasks(List<Future<BigInteger>> futures, boolean remoteCalls,
+                                               Throwable failure) throws RemoteException {
         List<BigInteger> results = new ArrayList<>();
-        RemoteException failure = null;
-        // Drain every dispatch, including after failure, before allowing term rotation.
-        for (Future<BigInteger> future : futures) {
-            try { results.add(future.get()); }
-            catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new RemoteException("Interrupted; job outcome unknown", e);
-            } catch (ExecutionException e) { failure = new RemoteException("Job failed; no partial answer", e.getCause()); }
+        boolean interrupted = false;
+        boolean uncertain = false;
+        try {
+            for (Future<BigInteger> future : futures) {
+                boolean finished = false;
+                while (!finished) {
+                    try {
+                        results.add(future.get());
+                        finished = true;
+                    } catch (InterruptedException e) {
+                        interrupted = true; // get() cleared the flag; restore only after draining.
+                        if (failure == null) failure = e;
+                    } catch (ExecutionException e) {
+                        Throwable cause = remoteCause(e.getCause());
+                        if (remoteCalls && !(cause instanceof JobFailedException)) uncertain = true;
+                        if (failure == null) failure = cause;
+                        finished = true;
+                    } catch (CancellationException e) {
+                        // Future cancellation is not confirmation that execution has stopped.
+                        uncertain = true;
+                        if (failure == null) failure = e;
+                        finished = true;
+                    }
+                }
+            }
+            if (uncertain) throw new RemoteException("Remote completion unknown; no partial answer", failure);
+            if (failure != null) throw new JobFailedException("Job failed after started work finished; no partial answer", failure);
+            return results;
+        } finally {
+            if (interrupted) Thread.currentThread().interrupt();
         }
-        if (failure != null) throw failure;
-        return engine.aggregate(job.type(), results);
     }
 
     @Override public BigInteger compute(Job part) throws RemoteException {
-        if (engine == null) throw new RemoteException("JobEngine provider is not installed");
-        try { return execution.submit(() -> engine.compute(part)).get(); }
-        catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new RemoteException("Computation interrupted", e);
-        } catch (ExecutionException e) { throw new RemoteException("Computation failed", e.getCause()); }
+        if (engine == null) throw new JobFailedException("JobEngine provider is not installed", null);
+        Future<BigInteger> task;
+        try { task = execution.submit(() -> engine.compute(part)); }
+        catch (RuntimeException e) { throw new JobFailedException("Computation could not start", e); }
+        return awaitTasks(List.of(task), false, null).getFirst();
     }
 
     public static void main(String[] args) throws Exception {

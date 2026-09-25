@@ -131,9 +131,12 @@ trusted membership during jobs/elections and does not provide durable recovery.
   reachable address and allow its configured registry and RMI object ports.
 - **JobEngine missing:** build integrated `main`; the network feature alone has
   contracts but intentionally no calculation provider.
-- **Timeout / failed neighbour:** no incomplete result is returned. A timed-out
-  job may already have been accepted; retries are manual. Large prime ranges can
-  be slow; increase the timeout or use smaller ranges. Restore/restart the cluster.
+- **Timeout / failed neighbour:** no incomplete result is returned. An assignment
+  or chunk transport failure may leave remote work running. The gate then rejects
+  new jobs and elections until the whole cluster is stopped and restarted; do not
+  retry on the same gate. Interruption waits for started work before reporting a
+  known failure. Large prime ranges can be slow; increase the timeout or use smaller
+  ranges. See [failure behavior](docs/network.md).
 - **Maven cannot download:** check network access to Maven Central. Java 21 is required.
 
 ## File map and Git
